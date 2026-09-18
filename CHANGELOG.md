@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Preserve Gemini thinking signatures across tool turns so a replayed `functionCall` is not rejected with HTTP 400. Empty trailing text parts no longer desynchronize DSH replay metadata. Private transport failures now surface a safe kind and HTTP status instead of the opaque "failed safely" card.
+
 ## [0.1.4-rc.1] - 2026-09-10
 
 - Completes English settings descriptions, localizes the ready status and capability control labels, and uses natural English/Chinese quota reset word order. Adds dictionary and language-switching regression coverage.

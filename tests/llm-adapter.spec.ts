@@ -242,6 +242,43 @@ describe('Antigravity LLM adapter', () => {
     expect(request).toHaveBeenCalledOnce()
   })
 
+  it('carries one response-level Gemini thinking signature into an unsigned tool call and replays it', async () => {
+    const signature = 'gemini-thought-signature'
+    const body = 'data: {"response":{"parts":[{"text":"planning","thought":true},{"functionCall":{"id":"call-sig","name":"bash","args":{"command":"pwd"}}}],"thoughtSignature":"gemini-thought-signature"}}\n\n'
+    const adapter = new AntigravityAdapter({
+      auth: { credential: vi.fn(async () => credential('opaque-test-value')) },
+      transport: { request: vi.fn(async () => new Response(body)) },
+    })
+
+    const chunks = await collectThroughRuntime(adapter, options())
+    const finish = chunks.at(-1)
+    expect(finish?.type).toBe('finish')
+    if (finish?.type === 'finish') {
+      expect(finish.replayState).toMatchObject({
+        blocks: [
+          { kind: 'reasoning' },
+          { kind: 'tool-call', signature },
+        ],
+      })
+    }
+  })
+
+  it('drops trailing empty text parts so Gemini tool turns stay replayable', async () => {
+    const request = vi.fn(async () => new Response(
+      'data: {"response":{"parts":[{"text":"thinking","thought":true}]}}\n\n'
+      + 'data: {"response":{"parts":[{"functionCall":{"id":"call-1","name":"pwsh","args":{"command":"ls"}}}]}}\n\n'
+      + 'data: {"response":{"parts":[{"text":""}],"finishReason":"STOP"}}\n\n',
+    ))
+    const adapter = new AntigravityAdapter({
+      auth: { credential: vi.fn(async () => credential('access-secret')) },
+      transport: { request },
+    })
+    const chunks = await collect(adapter.stream(options({ model: 'antigravity-gemini-3.8-flash' })))
+
+    expect(chunks.some(chunk => chunk.type === 'block-start' && chunk.blockType === 'text')).toBe(false)
+    expect(chunks.some(chunk => chunk.type === 'block-end' && 'block' in chunk && chunk.block.type === 'tool-call')).toBe(true)
+  })
+
   it('maps a bounded multiline HTTP 400 SSE error to DSH context-overflow recovery', async () => {
     const providerDetail = 'prompt is too long: 200001 tokens > 200000 maximum'
     const payload = JSON.stringify({

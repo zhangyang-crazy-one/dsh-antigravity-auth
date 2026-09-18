@@ -317,6 +317,7 @@ export class AntigravityAdapter extends LlmAdapter {
     let usage: TokenUsage | undefined
     let finish: string | undefined
     let eventError: ProviderEvent['error']
+    let pendingSignature: string | undefined
     for await (const sse of iteratePrivateSse(response, {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       idleTimeoutMs: this.options.idleTimeoutMs,
@@ -334,11 +335,20 @@ export class AntigravityAdapter extends LlmAdapter {
       if (event.usage !== undefined) usage = event.usage
       if (event.finish !== undefined) finish = event.finish
       for (const part of event.parts) {
+        // Content-free non-tool parts must not announce a block. An emitted
+        // block-start that is never closed desynchronizes replay metadata from
+        // the assembled blocks, which makes DSH drop the whole turn's signatures.
+        if (part.kind !== 'tool-call' && part.text.length === 0) {
+          if (part.signature !== undefined) pendingSignature = part.signature
+          continue
+        }
         if (current === undefined || !sameBlock(current, part)) {
           if (current !== undefined) {
             yield endBlock(current)
           }
           current = beginBlock(states, part)
+          if (current.signature === undefined && pendingSignature !== undefined) current.signature = pendingSignature
+          pendingSignature = undefined
           yield { type: 'block-start', index: current.index, blockType: current.kind }
         }
         if (part.kind === 'tool-call') {
@@ -356,6 +366,7 @@ export class AntigravityAdapter extends LlmAdapter {
         } else if (part.kind === 'reasoning') {
           current.text += part.text
           hasEmitted.value ||= part.text.length > 0
+          if (part.signature !== undefined) current.signature = part.signature
           if (part.text.length > 0) yield { type: 'reasoning-delta', index: current.index, text: part.text }
         } else {
           current.text += part.text
@@ -381,6 +392,16 @@ export class AntigravityAdapter extends LlmAdapter {
     if (states.length === 0) {
       yield finishChunk('error', 'EMPTY_RESPONSE')
       return
+    }
+    // Trailing content-free frames can carry the signature that validates a
+    // tool call. Seed the backfill with that pending value so it is not dropped.
+    let lastReasoningSignature: string | undefined = pendingSignature
+    for (const state of states) {
+      if (state.kind === 'reasoning' && state.signature !== undefined) {
+        lastReasoningSignature = state.signature
+      } else if (state.kind === 'tool-call' && state.signature === undefined && lastReasoningSignature !== undefined) {
+        state.signature = lastReasoningSignature
+      }
     }
     const replayBlocks: AntigravityReplayBlock[] = states.map(state => ({
       kind: state.kind,
@@ -900,10 +921,26 @@ function claudeToolTypeHint(value: unknown): string {
   return type
 }
 
+function findMessageReasoningSignature(
+  message: Message,
+  replayBlocks: readonly AntigravityReplayBlock[],
+): string | undefined {
+  const fromReplay = replayBlocks.find(block => block.kind === 'reasoning' && block.signature !== undefined)?.signature
+  if (fromReplay !== undefined) return fromReplay
+  for (const block of message.content) {
+    if (block.type !== 'reasoning') continue
+    const signature = (block as unknown as { signature?: string; thoughtSignature?: string }).signature
+      ?? (block as unknown as { signature?: string; thoughtSignature?: string }).thoughtSignature
+    if (typeof signature === 'string' && signature.length > 0) return signature
+  }
+  return undefined
+}
+
 function mapMessage(message: Message, model: string, toolNames: Map<string, string>): Record<string, unknown> {
   const parts: Record<string, unknown>[] = []
   const replay = compatibleReplayState(message, ANTIGRAVITY_PROVIDER, model, contentKinds(message))
   const replayBlocks = replay?.blocks ?? []
+  const messageReasoningSignature = findMessageReasoningSignature(message, replayBlocks)
   const isClaude = antigravityModelFamily(model) === 'claude'
   let replayIndex = 0
   let sawClaudeFunctionCall = false
@@ -924,7 +961,7 @@ function mapMessage(message: Message, model: string, toolNames: Map<string, stri
       const callId = rememberToolName(toolNames, block.id, block.name)
       const signature = isClaude
         ? sawClaudeFunctionCall ? undefined : blockSignature ?? SKIP_THOUGHT_SIGNATURE
-        : blockSignature
+        : blockSignature ?? messageReasoningSignature ?? SKIP_THOUGHT_SIGNATURE
       sawClaudeFunctionCall ||= isClaude
       parts.push({
         functionCall: {
@@ -964,6 +1001,7 @@ async function mapMessageWithAttachments(
   if (attachments === undefined) throw new LlmError('Antigravity image input requires the Host AttachmentStore', 'UNSUPPORTED_MODALITY')
   const replay = compatibleReplayState(message, ANTIGRAVITY_PROVIDER, model, contentKinds(message))
   const replayBlocks = replay?.blocks ?? []
+  const messageReasoningSignature = findMessageReasoningSignature(message, replayBlocks)
   const parts: Record<string, unknown>[] = []
   const isClaude = antigravityModelFamily(model) === 'claude'
   let replayIndex = 0
@@ -988,7 +1026,7 @@ async function mapMessageWithAttachments(
       const callId = rememberToolName(toolNames, block.id, block.name)
       const signature = isClaude
         ? sawClaudeFunctionCall ? undefined : blockSignature ?? SKIP_THOUGHT_SIGNATURE
-        : blockSignature
+        : blockSignature ?? messageReasoningSignature ?? SKIP_THOUGHT_SIGNATURE
       sawClaudeFunctionCall ||= isClaude
       parts.push({
         functionCall: {
@@ -1074,10 +1112,19 @@ function parseProviderEvent(data: string): ProviderEvent {
   const root = isRecord(value.response) ? value.response : value
   if (isRecord(root.error)) return { parts: [], error: errorDetails(root.error) }
   const partsValue = findParts(root)
+  // Gemini often puts thoughtSignature on the response/candidate envelope, not
+  // on each functionCall part. Without copying it, replayed tool calls go
+  // unsigned and the endpoint rejects the next turn with HTTP 400.
+  const responseSignature = responseLevelSignature(root, value, partsValue)
   const parts: ProviderPart[] = []
   for (const part of partsValue) {
     const parsed = parsePart(part)
-    if (parsed !== undefined) parts.push(parsed)
+    if (parsed === undefined) continue
+    if (parsed.kind === 'tool-call' && parsed.signature === undefined && responseSignature !== undefined) {
+      parts.push({ ...parsed, signature: responseSignature })
+      continue
+    }
+    parts.push(parsed)
   }
   const usage = parseUsage(root.usageMetadata ?? value.usageMetadata)
   const finish = findFinish(root)
@@ -1086,6 +1133,30 @@ function parseProviderEvent(data: string): ProviderEvent {
     ...(usage === undefined ? {} : { usage }),
     ...(finish === undefined ? {} : { finish }),
   }
+}
+
+/** First provider-issued signature carried by the response envelope itself. */
+function responseLevelSignature(
+  root: Record<string, unknown>,
+  envelope: Record<string, unknown>,
+  parts: readonly unknown[],
+): string | undefined {
+  const direct = signatureOf(root) ?? signatureOf(envelope)
+  if (direct !== undefined) return direct
+  if (Array.isArray(root.candidates)) {
+    for (const candidate of root.candidates) {
+      if (!isRecord(candidate)) continue
+      const candidateSignature = signatureOf(candidate)
+        ?? (isRecord(candidate.content) ? signatureOf(candidate.content) : undefined)
+      if (candidateSignature !== undefined) return candidateSignature
+    }
+  }
+  for (const part of parts) {
+    if (!isRecord(part)) continue
+    const partSignature = signatureOf(part)
+    if (partSignature !== undefined) return partSignature
+  }
+  return undefined
 }
 
 function findParts(value: Record<string, unknown>): unknown[] {
@@ -1135,6 +1206,7 @@ function parsePart(value: unknown): ProviderPart | undefined {
     const kind = value.thought === true || value.reasoning === true || value.thinking === true ? 'reasoning' as const : 'text' as const
     const signature = signatureOf(value)
     const text = typeof value.text === 'string' ? value.text : ''
+    if (kind === 'text' && text.length === 0 && signature === undefined) return undefined
     return { kind, text, ...(signature === undefined ? {} : { signature }) }
   }
   if (value.inlineData !== undefined || value.inline_data !== undefined) {
@@ -1356,14 +1428,28 @@ function toModelCatalogError(
   return new LlmError('The Antigravity live model catalog did not match the audited schema', 'PROTOCOL_DRIFT')
 }
 
+const LLM_FAILURE_MESSAGES: Readonly<Record<PrivateFailureKind, string>> = {
+  authentication: 'The Antigravity private request failed: authentication required',
+  forbidden: 'The Antigravity private request failed: this account is forbidden',
+  'rate-limited': 'Antigravity rate limit reached (Google returned 429 Resource Exhausted); please wait for your quota window to refresh',
+  cancelled: 'The Antigravity private request was cancelled',
+  timeout: 'The Antigravity private request timed out',
+  'attribution-rejected': 'The Antigravity private request failed: identity attribution was rejected',
+  'protocol-drift': 'The Antigravity private request was rejected (protocol drift)',
+  'response-limit': 'The Antigravity private response exceeded the byte limit',
+  'request-limit': 'The Antigravity private request exceeded the byte limit',
+  upstream: 'The Antigravity private endpoint is unavailable',
+  network: 'The Antigravity private request could not be reached',
+  failed: 'The Antigravity private request failed safely',
+}
+
 function toLlmError(error: unknown): LlmError {
   if (error instanceof LlmError) return error
   if (error instanceof PrivateTransportError) {
     const kind = classifyPrivateFailure(error)
     const code = LLM_FAILURE_CODES[kind]
-    const message = kind === 'rate-limited'
-      ? 'Antigravity rate limit reached (Google returned 429 Resource Exhausted); please wait for your quota window to refresh'
-      : 'The Antigravity private request failed safely'
+    const base = LLM_FAILURE_MESSAGES[kind]
+    const message = error.status === undefined ? base : `${base} (HTTP ${String(error.status)})`
     return error.status === undefined
       ? new LlmError(message, code)
       : new LlmError(message, code, { status: error.status })
